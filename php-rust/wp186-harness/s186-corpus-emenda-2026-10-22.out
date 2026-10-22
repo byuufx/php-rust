@@ -12,7 +12,7 @@ NUOVI FAIL: nessuno (entrambi i modi).
 GOLDEN RI-BASATI (sha256 del chunk, prefisso 8; identici nei due modi): test ANCORA falliti il cui output cambia
   closures/bug70685.phpt                     793ef11a → 17efff37   timing-only: handle-id #2→#4 della seconda Closure (Zend stampa NULL)
   coalesce/assign_coalesce_002.phpt          5b5d181c → 7abc7fa9   verso l'oracle: secondo caso `$ary[new Dtor][id($foo)] ??=` ora == atteso
-  exceptions/bug47771.phpt                   87ae23d7 → e89acabb   timing-only dentro divergenza pre-esistente (ctor-failed: Zend non costruisce `new Test(throw_exc())`)
+  exceptions/bug47771.phpt                   87ae23d7 → e89acabb   timing-only dentro divergenza pre-esistente FUORI famiglia §3.35 (regola ctor-failed: Zend non costruisce `new Test(throw_exc())` se un argomento lancia — Hoare E1, concilio S-186; da catalogare per NOME)
   exceptions/bug53511.phpt                   2513326f → 23cf4cc7   verso l'oracle: sparita la riga spuria «ops 2»
   magic_methods/bug29368_3.phpt              04117002 → 08587a09   verso l'oracle: Foo::__destruct prima di Bar::__destruct
   temporary_cleaning/temporary_cleaning_013.phpt 673e1e5e → 5ec49c82 verso l'oracle: sparito `string(4) "afoo"` prima di «caught Exception 1»
