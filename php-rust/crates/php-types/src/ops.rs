@@ -553,7 +553,16 @@ pub fn stable_sort_by<T: Clone>(
 }
 
 /// zend_compare (zend_operators.c:2306-2470), minus objects/resources/refs.
+/// Ordering API: a cyclic object graph is uncomparable (1, Zend's
+/// `ZEND_UNCOMPARABLE`); the VM uses [`compare_checked`] to throw the `Error`
+/// instead (§3.34).
 pub fn compare(a: &Zval, b: &Zval) -> i32 {
+    compare_r(a, b).unwrap_or(1)
+}
+
+
+/// [`compare`] with the recursion guard of [`cmp_protect`] propagated.
+fn compare_r(a: &Zval, b: &Zval) -> Result<i32, NestingTooDeep> {
     // Follow references up front (D-R11): the rest of the routine, and the
     // recursive `compare_arrays` call, then only ever see plain values.
     let mut oa = a.deref_clone();
@@ -561,11 +570,11 @@ pub fn compare(a: &Zval, b: &Zval) -> i32 {
     let mut converted = false;
     loop {
         match (&oa, &ob) {
-            (Zval::Long(l), Zval::Long(r)) => return threeway_i(*l, *r),
-            (Zval::Double(l), Zval::Long(r)) => return threeway(*l, *r as f64),
-            (Zval::Long(l), Zval::Double(r)) => return threeway(*l as f64, *r),
-            (Zval::Double(l), Zval::Double(r)) => return threeway(*l, *r),
-            (Zval::Array(l), Zval::Array(r)) => return compare_arrays(l, r),
+            (Zval::Long(l), Zval::Long(r)) => return Ok(threeway_i(*l, *r)),
+            (Zval::Double(l), Zval::Long(r)) => return Ok(threeway(*l, *r as f64)),
+            (Zval::Long(l), Zval::Double(r)) => return Ok(threeway(*l as f64, *r)),
+            (Zval::Double(l), Zval::Double(r)) => return Ok(threeway(*l, *r)),
+            (Zval::Array(l), Zval::Array(r)) => return Ok(compare_arrays(l, r)),
             // Zend's date_object_compare: DateTime / DateTimeImmutable compare
             // by absolute instant, cross-class and cross-timezone. The same
             // instance orders equal (zend_compare's identity fast path).
@@ -576,29 +585,35 @@ pub fn compare(a: &Zval, b: &Zval) -> i32 {
             // canonicalize (sort of stdClass rows) rides on this ordering.
             (Zval::Object(l), Zval::Object(r)) => {
                 if Rc::ptr_eq(l, r) {
-                    return 0;
+                    return Ok(0);
                 }
                 if let (Some(x), Some(y)) = (datetime_instant(&l.borrow()), datetime_instant(&r.borrow())) {
-                    return match x.cmp(&y) {
+                    return Ok(match x.cmp(&y) {
                         std::cmp::Ordering::Less => -1,
                         std::cmp::Ordering::Equal => 0,
                         std::cmp::Ordering::Greater => 1,
-                    };
+                    });
                 }
+                // Zend protects the LEFT object while its properties are
+                // walked (after the class check, before the counts); meeting
+                // it again is the cycle of §3.34 (bug63882). The guard lives
+                // until the pairs are compared.
+                let _guard;
                 let pairs = {
                     let (lb, rb) = (l.borrow(), r.borrow());
                     if lb.class_id != rb.class_id {
-                        return 1;
+                        return Ok(1);
                     }
                     // Enum cases are singletons: only identity (handled
                     // above) orders them equal, never their name/value props
                     // (Zend/tests/enum/comparison: `<`/`>` all false).
                     if lb.info.is_enum_case || rb.info.is_enum_case {
-                        return 1;
+                        return Ok(1);
                     }
+                    _guard = cmp_protect(l)?;
                     let (nl, nr) = (lb.props.len(), rb.props.len());
                     if nl != nr {
-                        return if nl > nr { 1 } else { -1 };
+                        return Ok(if nl > nr { 1 } else { -1 });
                     }
                     // Snapshot the value pairs so the recursive compare runs
                     // without the RefCell borrows held (self-referential
@@ -607,53 +622,53 @@ pub fn compare(a: &Zval, b: &Zval) -> i32 {
                     for (k, lv) in lb.props.iter() {
                         match rb.props.get(k) {
                             Some(rv) => pairs.push((lv.clone(), rv.clone())),
-                            None => return 1,
+                            None => return Ok(1),
                         }
                     }
                     pairs
                 };
                 for (lv, rv) in &pairs {
-                    let c = compare(lv, rv);
+                    let c = compare_r(lv, rv)?;
                     if c != 0 {
-                        return c;
+                        return Ok(c);
                     }
                 }
-                return 0;
+                return Ok(0);
             }
             // Two resources compare by their numeric id (oracle: `$a < $b` is
             // `id_a < id_b`, step 51).
             (Zval::Resource(l), Zval::Resource(r)) => {
-                return threeway_i(l.borrow().id as i64, r.borrow().id as i64)
+                return Ok(threeway_i(l.borrow().id as i64, r.borrow().id as i64))
             }
-            (Zval::Undef | Zval::Null, Zval::Undef | Zval::Null) => return 0,
-            (Zval::Undef | Zval::Null, Zval::Bool(rb)) => return if *rb { -1 } else { 0 },
-            (Zval::Bool(lb), Zval::Undef | Zval::Null) => return if *lb { 1 } else { 0 },
-            (Zval::Bool(lb), Zval::Bool(rb)) => return threeway_i(*lb as i64, *rb as i64),
+            (Zval::Undef | Zval::Null, Zval::Undef | Zval::Null) => return Ok(0),
+            (Zval::Undef | Zval::Null, Zval::Bool(rb)) => return Ok(if *rb { -1 } else { 0 }),
+            (Zval::Bool(lb), Zval::Undef | Zval::Null) => return Ok(if *lb { 1 } else { 0 }),
+            (Zval::Bool(lb), Zval::Bool(rb)) => return Ok(threeway_i(*lb as i64, *rb as i64)),
             (Zval::Str(l), Zval::Str(r)) => {
                 if ZStr::ptr_eq(l, r) {
-                    return 0;
+                    return Ok(0);
                 }
-                return smart_strcmp(l, r);
+                return Ok(smart_strcmp(l, r));
             }
             (Zval::Undef | Zval::Null, Zval::Str(r)) => {
-                return if r.is_empty() { 0 } else { -1 };
+                return Ok(if r.is_empty() { 0 } else { -1 });
             }
             (Zval::Str(l), Zval::Undef | Zval::Null) => {
-                return if l.is_empty() { 0 } else { 1 };
+                return Ok(if l.is_empty() { 0 } else { 1 });
             }
-            (Zval::Long(l), Zval::Str(r)) => return compare_long_to_string(*l, r),
-            (Zval::Str(l), Zval::Long(r)) => return -compare_long_to_string(*r, l),
+            (Zval::Long(l), Zval::Str(r)) => return Ok(compare_long_to_string(*l, r)),
+            (Zval::Str(l), Zval::Long(r)) => return Ok(-compare_long_to_string(*r, l)),
             (Zval::Double(l), Zval::Str(r)) => {
                 if l.is_nan() {
-                    return 1;
+                    return Ok(1);
                 }
-                return compare_double_to_string(*l, r);
+                return Ok(compare_double_to_string(*l, r));
             }
             (Zval::Str(l), Zval::Double(r)) => {
                 if r.is_nan() {
-                    return 1;
+                    return Ok(1);
                 }
-                return -compare_double_to_string(*r, l);
+                return Ok(-compare_double_to_string(*r, l));
             }
             _ => {
                 if !converted {
@@ -661,12 +676,12 @@ pub fn compare(a: &Zval, b: &Zval) -> i32 {
                         || matches!(&ob, Zval::Double(d) if d.is_nan());
                     if nan_present {
                         if type_lt_true(&oa) {
-                            return -1;
+                            return Ok(-1);
                         } else if matches!(oa, Zval::Bool(true)) || matches!(ob, Zval::Bool(true))
                         {
-                            return 0;
+                            return Ok(0);
                         } else if type_lt_true(&ob) {
-                            return 1;
+                            return Ok(1);
                         } else if !matches!(oa, Zval::Double(_)) {
                             oa = scalar_to_number_silent(&oa);
                             converted = true;
@@ -675,24 +690,24 @@ pub fn compare(a: &Zval, b: &Zval) -> i32 {
                             converted = true;
                         }
                     } else if type_lt_true(&oa) {
-                        return if is_true_silent(&ob) { -1 } else { 0 };
+                        return Ok(if is_true_silent(&ob) { -1 } else { 0 });
                     } else if matches!(oa, Zval::Bool(true)) {
-                        return if is_true_silent(&ob) { 0 } else { 1 };
+                        return Ok(if is_true_silent(&ob) { 0 } else { 1 });
                     } else if type_lt_true(&ob) {
-                        return if is_true_silent(&oa) { 1 } else { 0 };
+                        return Ok(if is_true_silent(&oa) { 1 } else { 0 });
                     } else if matches!(ob, Zval::Bool(true)) {
-                        return if is_true_silent(&oa) { 0 } else { -1 };
+                        return Ok(if is_true_silent(&oa) { 0 } else { -1 });
                     } else {
                         oa = scalar_to_number_silent(&oa);
                         ob = scalar_to_number_silent(&ob);
                         converted = true;
                     }
                 } else if matches!(oa, Zval::Array(_)) {
-                    return 1;
+                    return Ok(1);
                 } else if matches!(ob, Zval::Array(_)) {
-                    return -1;
+                    return Ok(-1);
                 } else {
-                    return 1;
+                    return Ok(1);
                 }
             }
         }
@@ -892,10 +907,98 @@ fn compare_arrays(a: &PhpArray, b: &PhpArray) -> i32 {
     0
 }
 
-/// Loose equality with the engine's fast paths (smart_streq for strings,
-/// native IEEE for doubles).
-pub fn loose_eq(a: &Zval, b: &Zval) -> bool {
+// Zend's recursion protection for comparing self-referential object graphs
+// (`zend_std_compare_objects`: `Z_PROTECT_RECURSION` on the LEFT operand only —
+// the right one may be reachable from the left, and protecting both would
+// report false recursion). The left object's handle pointer sits on this
+// stack while its property table is being compared; meeting it again means
+// the graph closed a cycle and PHP throws
+// `Error("Nesting level too deep - recursive dependency?")`. §3.34
+// (Zend/tests/bug63882.phpt): without it `loose_eq` recursed through
+// `$a->x = $a` until the thread's stack overflowed (SIGABRT, rc 134).
+thread_local! {
+    static CMP_OBJECTS_IN_PROGRESS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A comparison met a cyclic dependency. The VM-facing `*_checked` entry
+/// points turn it into the catchable `Error`; the boolean API treats the pair
+/// as uncomparable (Zend returns `ZEND_UNCOMPARABLE` next to the thrown error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestingTooDeep;
+
+pub const NESTING_TOO_DEEP_MSG: &str = "Nesting level too deep - recursive dependency?";
+
+impl From<NestingTooDeep> for PhpError {
+    fn from(_: NestingTooDeep) -> Self {
+        PhpError::Error(NESTING_TOO_DEEP_MSG.to_string())
+    }
+}
+
+/// Unprotects the object pushed by [`cmp_protect`] when the comparison of its
+/// property table ends (normally or through an early return).
+struct CmpGuard;
+
+impl Drop for CmpGuard {
+    fn drop(&mut self) {
+        CMP_OBJECTS_IN_PROGRESS.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Protect `left` for the duration of its property comparison; `Err` when it is
+/// already protected, i.e. the walk came back to it.
+fn cmp_protect<T>(left: &Rc<T>) -> Result<CmpGuard, NestingTooDeep> {
+    let key = Rc::as_ptr(left) as *const () as usize;
+    CMP_OBJECTS_IN_PROGRESS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.contains(&key) {
+            return Err(NestingTooDeep);
+        }
+        s.push(key);
+        Ok(CmpGuard)
+    })
+}
+
+/// `==` for the VM: the recursion guard surfaces as the catchable `Error`.
+pub fn loose_eq_checked(a: &Zval, b: &Zval) -> Result<bool, PhpError> {
+    Ok(loose_eq_r(a, b)?)
+}
+
+/// `<=>` for the VM: the recursion guard surfaces as the catchable `Error`.
+pub fn compare_checked(a: &Zval, b: &Zval) -> Result<i32, PhpError> {
+    Ok(compare_r(a, b)?)
+}
+
+/// `<` for the VM (see [`smaller`]), recursion guard surfaced.
+pub fn smaller_checked(a: &Zval, b: &Zval) -> Result<bool, PhpError> {
     match (a, b) {
+        (Zval::Object(_), Zval::Object(_)) => Ok(compare_r(a, b)? < 0),
+        _ => Ok(smaller(a, b)),
+    }
+}
+
+/// `<=` for the VM (see [`smaller_or_equal`]), recursion guard surfaced.
+pub fn smaller_or_equal_checked(a: &Zval, b: &Zval) -> Result<bool, PhpError> {
+    match (a, b) {
+        (Zval::Object(_), Zval::Object(_)) => Ok(compare_r(a, b)? <= 0),
+        _ => Ok(smaller_or_equal(a, b)),
+    }
+}
+
+/// Loose equality with the engine's fast paths (smart_streq for strings,
+/// native IEEE for doubles). Boolean API: a cyclic object graph compares
+/// unequal (Zend's `ZEND_UNCOMPARABLE`); the VM uses [`loose_eq_checked`] to
+/// throw the `Error` instead (§3.34).
+pub fn loose_eq(a: &Zval, b: &Zval) -> bool {
+    loose_eq_r(a, b).unwrap_or(false)
+}
+
+
+/// [`loose_eq`] with the recursion guard of [`cmp_protect`] propagated.
+fn loose_eq_r(a: &Zval, b: &Zval) -> Result<bool, NestingTooDeep> {
+    Ok(match (a, b) {
         (Zval::Long(l), Zval::Long(r)) => l == r,
         (Zval::Double(l), Zval::Double(r)) => l == r,
         (Zval::Long(l), Zval::Double(r)) => *l as f64 == *r,
@@ -908,39 +1011,53 @@ pub fn loose_eq(a: &Zval, b: &Zval) -> bool {
         // walk below (object => uncomparable => 1) cannot express.
         (Zval::Array(l), Zval::Array(r)) => {
             if Rc::ptr_eq(l, r) {
-                return true;
+                return Ok(true);
             }
             if l.len() != r.len() {
-                return false;
+                return Ok(false);
             }
-            l.iter().all(|(k, v1)| r.get(&k).is_some_and(|v2| loose_eq(v1, v2)))
+            for (k, v1) in l.iter() {
+                match r.get(&k) {
+                    Some(v2) if loose_eq_r(v1, v2)? => {}
+                    _ => return Ok(false),
+                }
+            }
+            true
         }
         // Two objects are loosely equal iff they are the same instance, or share
         // the same class and every property is loosely equal (PHP object `==`).
         // For enum case singletons this reduces to identity (step 23).
         (Zval::Object(l), Zval::Object(r)) => {
             if Rc::ptr_eq(l, r) {
-                return true;
+                return Ok(true);
             }
             let (lb, rb) = (l.borrow(), r.borrow());
             // Two date objects are `==` iff they denote the same instant —
             // cross-class (DateTime vs DateTimeImmutable) and cross-timezone
             // (Zend's date_object_compare), unlike the per-property rule.
             if let (Some(x), Some(y)) = (datetime_instant(&lb), datetime_instant(&rb)) {
-                return x == y;
+                return Ok(x == y);
             }
-            lb.class_id == rb.class_id
-                && lb.props.len() == rb.props.len()
-                && lb
-                    .props
-                    .iter()
-                    .zip(rb.props.iter())
-                    .all(|((k1, v1), (k2, v2))| k1 == k2 && loose_eq(v1, v2))
+            if lb.class_id != rb.class_id {
+                return Ok(false);
+            }
+            // Zend protects the LEFT object while its properties are walked;
+            // meeting it again is the cycle of §3.34 (bug63882).
+            let _guard = cmp_protect(l)?;
+            if lb.props.len() != rb.props.len() {
+                return Ok(false);
+            }
+            for ((k1, v1), (k2, v2)) in lb.props.iter().zip(rb.props.iter()) {
+                if k1 != k2 || !loose_eq_r(v1, v2)? {
+                    return Ok(false);
+                }
+            }
+            true
         }
-        (Zval::Ref(c), _) => loose_eq(&c.borrow(), b),
-        (_, Zval::Ref(c)) => loose_eq(a, &c.borrow()),
-        _ => compare(a, b) == 0,
-    }
+        (Zval::Ref(c), _) => loose_eq_r(&c.borrow(), b)?,
+        (_, Zval::Ref(c)) => loose_eq_r(a, &c.borrow())?,
+        _ => compare_r(a, b)? == 0,
+    })
 }
 
 /// `<` with VM double fast path (NAN-correct), compare() fallback.

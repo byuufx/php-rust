@@ -3989,6 +3989,22 @@ impl<'m> Vm<'m> {
                     self.gc_idle_set([false; 2]);
                     #[cfg(feature = "gc-census")]
                     gc_census::note_inserted();
+                } else {
+                    // Already buffered (birth seed, or an earlier note): this
+                    // is a LATER release, so the entry moves to the tail — the
+                    // sweep pops FIFO and Zend frees in release order. §3.35
+                    // form 3: `f(new A, new B)` dies A then B at leave, but
+                    // B's constructor-sweep demotion and `$this` re-note had
+                    // queued B ahead of A. The BIRTH mark is kept as it is
+                    // (a release note never flips it — `gc_buf_push`).
+                    let pos = b.gc.pos();
+                    drop(b);
+                    if let Some(p) = pos.filter(|&p| p >= self.gc_buf_head) {
+                        if let Some(entry) = self.gc_buf[p].take() {
+                            entry.borrow().gc.set_pos(self.gc_buf.len());
+                            self.gc_buf.push(Some(entry));
+                        }
+                    }
                 }
             }
             Zval::Ref(r) => {
@@ -4139,6 +4155,37 @@ impl<'m> Vm<'m> {
 
     fn gc_sweep(&mut self, top: usize, ip: usize, main: bool) -> Result<(), PhpError> {
         self.gc_sweep_impl(Some((top, ip)), main)
+    }
+
+
+    /// §3.35 (forms 1 and 3): Zend frees a returning frame's CVs and arguments
+    /// at `leave` (`i_free_compiled_variables`, first to last), so a local whose
+    /// last reference died with the frame runs its `__destruct` BEFORE the
+    /// caller continues — `echo "x: ", f(), "\n"` prints the destructor ahead of
+    /// the value. phpr's Ret only NOTES the dying values (or finds them already
+    /// buffered since birth) and left them to the caller's statement-end Sweep.
+    /// Called after the release (slots and stack cleared, frame gone): if a
+    /// buffered candidate is collectable NOW (`created` + buffer clone = 2), the
+    /// buffer is drained synchronously and FIFO — note/birth order, Zend's
+    /// forward CV order — as a LIGHT sweep (demotions are re-seeded by the next
+    /// main sweep, like any mid-statement one). Stays out of the way of a
+    /// scheduled sweep in flight (`gc_buf_head != 0`: its Sweep op re-runs after
+    /// the destructor it pushed), of the cycle collector, and of a caller that
+    /// is a destructor body (its sweeps are silent — Frame::in_destructor).
+    #[inline]
+    fn gc_sweep_after_ret(&mut self, caller: usize) -> Result<(), PhpError> {
+        if self.gc_buf_head == 0
+            && !self.gc_buf.is_empty()
+            && !self.gc_collecting
+            && !self.frames[caller].flags.get(FrameFlags::IN_DESTRUCTOR)
+            && self
+                .gc_buf
+                .iter()
+                .any(|s| s.as_ref().is_some_and(|o| Rc::strong_count(o) == 2))
+        {
+            self.gc_sweep_impl(None, false)?;
+        }
+        Ok(())
     }
 
     /// The sweep body. `resume = Some((top, ip))` is the statement-level mode:
@@ -4465,6 +4512,12 @@ impl<'m> Vm<'m> {
                         frame.ret_cell = None;
                         let baseline = self.frames.len();
                         self.frames.push(frame);
+                        // The frame's `this` must be the LAST holder when the
+                        // destructor returns: `gc_note_receiver` cascades the
+                        // children only at `strong_count == 1`, and our own
+                        // clone would hide that (the children then waited for
+                        // the next statement sweep — §3.35, `I:` form).
+                        drop(o);
                         let _ = self.drive_to_return(baseline)?;
                         continue;
                     }
@@ -4629,6 +4682,17 @@ impl<'m> Vm<'m> {
         }
         for it in &frame.iters {
             self.gc_note_iter(it);
+        }
+        // `$$name` variables die with the frame too (Zend destroys the symbol
+        // table after the CVs: `[c2][c1]q`). The table is a HashMap, so they
+        // are noted in name order to keep the destructor order deterministic
+        // (§3.35 cure, 2026-10-22; was: never noted, freed at a later sweep).
+        if let Some(dv) = frame.dyn_vars.as_deref() {
+            let mut names: Vec<&Vec<u8>> = dv.keys().collect();
+            names.sort();
+            for k in names {
+                self.gc_note(&dv[k]);
+            }
         }
         if let Some(exc) = frame.ext().and_then(|e| e.pending_throw.as_ref()) {
             self.gc_note(exc);
@@ -18571,16 +18635,18 @@ fn apply_binop(op: BinOp, a: &Zval, b: &Zval, d: &mut Diags) -> Result<Zval, Php
         BitXor => ops::bw_xor(a, b, d)?,
         Shl => ops::shl(a, b, d)?,
         Shr => ops::shr(a, b, d)?,
-        Eq => Zval::Bool(ops::loose_eq(a, b)),
-        NotEq => Zval::Bool(!ops::loose_eq(a, b)),
+        // §3.34: the `*_checked` forms throw Zend's catchable `Error` when a
+        // cyclic object graph is compared (bug63882) instead of recursing.
+        Eq => Zval::Bool(ops::loose_eq_checked(a, b)?),
+        NotEq => Zval::Bool(!ops::loose_eq_checked(a, b)?),
         Identical => Zval::Bool(ops::identical(a, b)),
         NotIdentical => Zval::Bool(!ops::identical(a, b)),
-        Lt => Zval::Bool(ops::smaller(a, b)),
-        Le => Zval::Bool(ops::smaller_or_equal(a, b)),
+        Lt => Zval::Bool(ops::smaller_checked(a, b)?),
+        Le => Zval::Bool(ops::smaller_or_equal_checked(a, b)?),
         // `a > b` is `b < a`; `a >= b` is `b <= a`.
-        Gt => Zval::Bool(ops::smaller(b, a)),
-        Ge => Zval::Bool(ops::smaller_or_equal(b, a)),
-        Spaceship => Zval::Long(ops::compare(a, b) as i64),
+        Gt => Zval::Bool(ops::smaller_checked(b, a)?),
+        Ge => Zval::Bool(ops::smaller_or_equal_checked(b, a)?),
+        Spaceship => Zval::Long(ops::compare_checked(a, b)? as i64),
     })
 }
 
@@ -22568,7 +22634,9 @@ mod tests {
                 function fx() { $name='dd'; $$name = new D('x1'); $local = new D('x3'); foreach ([new D('x2')] as $v) { return 'z'; } }
                 echo fx(); $n = new D('x4'); unset($n); echo '.';"
             ),
-            b"r[a2][a1][a3].m[b1][this][b2].q[c2][c1][c3].z[x2][x3][x1][x4]."
+            // RE-PINNED 2026-10-22 (cura §3.35: dtor dei locali al `leave`,
+            // ri-accodamento in nota, dyn_vars notate): == oracle php 8.5.7.
+            b"[a1][a2]r[a3].[b1][this]m[b2].[c2][c1]q[c3].[x3][x2][x1]z[x4]."
         );
     }
 
@@ -22590,7 +22658,10 @@ mod tests {
                 function f5($a) { $args = func_get_args(); return 'f'; }
                 echo f5(1, new D('e1'), new D('e2')); $n = new D('e3'); unset($n); echo '.';"
             ),
-            b"G[d3].f[e1][e2][e3].[d2][d1]"
+            // RE-PINNED 2026-10-22 (cura §3.35): extra args `[e1][e2]` muoiono
+            // al `leave`, PRIMA di `f` (== oracle); il generatore resta a
+            // shutdown (oracle: `[d1][d2]G…`, buco A-HO-103-2 invariato).
+            b"G[d3].[e1][e2]f[e3].[d2][d1]"
         );
     }
 
@@ -22609,7 +22680,10 @@ mod tests {
                 function f9() { try { throw new Exception('e'); } finally { $y = new D('u1'); } }
                 try { f9(); } catch (Exception $e) { echo 'C'; } $n = new D('u2'); unset($n); echo '.';"
             ),
-            b"prestrpost[s1][s2].Y[h1][h2][h3].[t2][t1][t3].C[u1][u2]."
+            // RE-PINNED 2026-10-22 (cura §3.35): i locali di __toString/__isset/
+            // __set muoiono al `leave` (== oracle); il locale del `finally`
+            // sotto srotolamento resta dopo `C` (oracle `[u1]C`: unwind, §3.35 (2)).
+            b"[s1]prestrpost[s2].[h1]Y[h2][h3].[t2][t1][t3].C[u1][u2]."
         );
     }
 
@@ -22649,7 +22723,9 @@ mod tests {
                 // displaced value noted at the re-assignment site
                 $w = new D('w1'); $w = new D('w2'); echo 'W'; unset($w); echo '.';"
             ),
-            b"1[a]2[x][y][z].ir[m].[p][c].[p][k1][k2].[w1]W[w2]."
+            // RE-PINNED 2026-10-22 (cura §3.35): `[m]` al `leave` di f(), PRIMA
+            // di `r` — == oracle php 8.5.7 byte-id.
+            b"1[a]2[x][y][z].i[m]r.[p][c].[p][k1][k2].[w1]W[w2]."
         );
     }
 

@@ -1015,10 +1015,15 @@ di costruire `R`, che non nasce mai); phpr valuta i value-arg al push e
 DIFFERISCE i place (SEND_VAR_EX) alla materializzazione ⇒ `R` nasce e
 muore, il suo dtor appare, il riuso degli handle-id diverge. Vale per ogni
 place con side-effect (`__get`, warning) che PRECEDE un value-arg.
-(ii) **timing/ordine dei dtor dei temp-argomento al ritorno**: Zend
+(ii) **CURATA 2026-10-22 (cura §3.35, `gc_sweep_after_ret`)**: Zend
 distrugge i temp PRIMA che il valore di ritorno sia consumato
-(`dtor:Da 9`); phpr DOPO il consumo (`9 dtor:Da`) — stessa radice
-timing-only delle entry WP-46/WP-56. Conteggi e contenuti identici.
+(`dtor:Da 9`); phpr lo faceva DOPO il consumo (`9 dtor:Da`) — ora C4 di
+fx-mc2 == oracle. Conteggi e contenuti identici. ATTENZIONE gate: la
+stessa cura sposta in C1 (forma (i), ancora divergente) i `dtor:Q dtor:R`
+PRIMA del testo dell'Error (al Ret di `getMessage()`): il gate INVARIANTE
+`fxmc2` (wp172, `invar` nella promozione) morde il prossimo candidato e va
+emendato DICHIARANDO (ri-basato sul nuovo pin, o convertito in `bilat`
+sulle sole righe C2-C4).
 L'«ordine slot inverso» (`Dy, Dx`) NON si riproduce su una funzione utente
 a due argomenti (entrambi `Dx, Dy`, verificato 2026-09-10): resta la sola
 componente di timing.
@@ -1077,33 +1082,43 @@ perimetro: solo codice che legge `gc_status()` tra l'abilitazione e la successiv
 della fixture: INVARIANZA pin == stash (non bilaterale). Un ciclo via `$a = []; $a[] = &$a;` NON lascia radici in
 nessuno dei due motori (la riassegnazione scrive attraverso il riferimento): non usarlo come pressione GC.
 
-### 3.34 🔴 Confronto `==` tra oggetti con proprietà ricorsive: STACK OVERFLOW (SIGABRT) invece dell'`Error` «Nesting level too deep - recursive dependency?» (S-184, Zend/tests/bug63882.phpt)
+### 3.34 ✅ CURATA 2026-10-22 — confronto (`==`, `!=`, `<`, `<=`, `>`, `>=`, `<=>`) tra oggetti ricorsivi: guardia di ricorsione invece dello STACK OVERFLOW (Zend/tests/bug63882.phpt)
 
-`$a->x = $a; $b->x = $b; var_dump($a == $b)`: Zend protegge la ricorsione in `zend_std_compare_objects`
-(`Z_IS_RECURSIVE` ⇒ `Error` catturabile «Nesting level too deep - recursive dependency?»), phpr ricorre senza guardia
-in `php_types::ops::loose_eq` (iteratore delle proprietà → `loose_eq` → …) finché il thread del test esaurisce la pila:
-`thread has overflowed its stack` / `fatal runtime error: stack overflow, aborting`, SIGABRT, rc 134 (confermato col
-runner del pin s182 `896bc9852a5f2ae7`, `--run-one`). È la fonte dei crash report `phpt-runner` ×1 per modo a ogni
-corpus-gate (`--isolate`: muore il figlio `--run-one`; il gate resta rc=0 perché il nome è nel fail-set congelato).
-Gli array ricorsivi (`recursive_array_comparison.phpt`) NON abortiscono (rc 0): la guardia manca solo sul ramo oggetti.
-Cura: contatore di profondità (o marca di ricorsione sulle proprietà) che lanci l'`Error` di Zend; cita il fail
-`bug63882.phpt` da flippare (1412 → 1411). Collaterale operativo: ReportCrash simbolizza il binario LTO per ore
-(S-184: 108 min CPU, SIGTERM ignorato, serve `kill -9`) ⇒ la sentinella CPU di fine finestra (az.rev. S-184 #4) deve
-elencarlo.
+Era: `$a->x = $a; $b->x = $b; $a == $b` ricorreva in `php_types::ops::loose_eq`/`compare` fino a esaurire la pila
+(SIGABRT, rc 134; fonte dei crash report `phpt-runner` ×1 per modo a ogni corpus-gate). Cura: `ops.rs` protegge
+l'oggetto SINISTRO mentre ne percorre le proprietà (stack thread-local `CMP_OBJECTS_IN_PROGRESS`, l'equivalente di
+`Z_PROTECT_RECURSION(o1)` in `zend_std_compare_objects`: solo il sinistro, il destro può essere raggiungibile da lui);
+rientrare sullo stesso oggetto = `NestingTooDeep`, che le forme `*_checked` usate da `apply_binop` convertono
+nell'`Error` catturabile «Nesting level too deep - recursive dependency?». L'API booleana dei builtin (`in_array`,
+`array_search`, `sort`…) resta «uncomparable» senza eccezione (Zend la lancerebbe anche lì: residuo minore, per NOME).
+Flip corpus: bug63882.phpt, bug49893.phpt, generators/bug71013.phpt (1412 → 1409 per modo) (nuovi fail: nessuno). Test: `crates/php-runtime/tests/leave_dtor_cmp_recursion.rs`.
+NON coperti (stessa famiglia, radice diversa): array ricorsivi `$a = [&$a]; $a === [[]]`
+(`recursive_array_comparison.phpt`: Zend lancia lo stesso Error, phpr risponde false senza abort) e `bug63882_2.phpt`
+(`arsort` su array ricorsivo: panic «RefCell already mutably borrowed»).
 
-### 3.35 🟡 Distruttore di un temporaneo DOPO la fine dell'istruzione invece che al rilascio dell'operando (S-185, fixture wp185-harness/fx-mc2.php + sonde del revisore)
+### 3.35 🟡 Distruttore di un temporaneo DOPO la fine dell'istruzione invece che al rilascio dell'operando (S-185, fixture wp185-harness/fx-mc2.php + sonde del revisore) — forme (1) e (3) CURATE 2026-10-22, resta la forma (2)
 
-Tre forme della stessa divergenza di MOMENTO (classe di §3.33: in phpr la raccolta avviene allo Sweep di fine
-statement, in Zend al rilascio dell'ultimo riferimento): (1) `echo "x: ", $o->mk('a'), "\n"` con `mk` che crea un
-oggetto locale: Zend stampa il `__destruct` PRIMA dell'argomento successivo dell'`echo`, phpr dopo l'intera `echo`;
-(2) `echo D::take()->m(1), "\n"` con ricevitore temporaneo risorto in una static (`self::$keep = $this` in
-`__destruct`): la cascata delle sue proprietà (`C dtor`) in Zend precede la stampa del valore, in phpr la segue, e
-l'handle-id del `new` successivo differisce (Zend riusa 1, phpr 2); (3) argomenti temporanei da funzione by-ref
-`$o->m(d(1), d(2))`: Zend distrugge X1 poi X2, phpr X2 poi X1 ⇒ `spl_object_id` dei due `new` seguenti invertiti
-(Zend «3 2», phpr «2 3»). Tutte e tre PREESISTENTI al pin s182 (pin == dev della leva (a), S-185 rev. rilievo 5);
-in istruzione propria (`$v = …; echo …`) le forme (1) e (2) tornano byte-identiche. Cura: stessa di §3.33 (rilascio
-al punto di morte dell'operando) + ordine di rilascio degli argomenti in avanti; da cercare per NOME nel fail-set
-congelato prima di ogni cura.
+Classe di §3.33 (in phpr la raccolta avviene allo Sweep di fine statement, in Zend al rilascio dell'ultimo
+riferimento). **CURATE 2026-10-22** (`gc_sweep_after_ret` in vm/mod.rs, hook nel Ret fuso e in `ret_slow`): al `Ret`,
+dopo il rilascio di slot/stack/`$this`, se un candidato del buffer è collezionabile ORA (`created` + clone del buffer
+= 2) il buffer viene drenato SINCRONO e FIFO (sweep light; `drop(o)` nel ramo sincrono perché la cascata dei figli al
+Ret del dtor esige `strong_count == 1`), e una nota su un oggetto GIÀ in buffer lo sposta in CODA (`gc_note_slow`:
+ordine di rilascio, non di prima nota — era la causa dell'ordine inverso h2/h1 degli argomenti: lo Sweep del
+costruttore di h2 demotava entrambi e il Ret del costruttore ri-accodava h2 prima di h1). Coperte: (1) locale del
+chiamato morto al ritorno (`echo "x: ", $o->mk('a'), "\n"`: il dtor PRIMA dell'argomento successivo, anche in `.`),
+(3) argomenti temporanei liberati in avanti (X1 poi X2), cascata dei figli di un locale distrutto PRIMA del valore,
+eccezione dal dtor al `leave` che scarta il ritorno e arriva al chiamante, variabili `$$name` notate al drop del
+frame (`gc_note_frame`, in ordine di nome: la tabella è una HashMap — Zend libera la symbol table dopo le CV:
+`[c2][c1]q`); le 4 sentinelle `*_drop_order_sentinel_*` di vm::tests sono state RI-PINNATE sul nuovo ordine (3 su
+4 == oracle; residui = generatore a shutdown e `finally` sotto unwind, già catalogati); effetto collaterale: §3.28 (ii) curata
+(wp172 fx-mc2 C4 == oracle). Test: `crates/php-runtime/tests/leave_dtor_cmp_recursion.rs`; corpus: 2 flip pass dalle forme (1)/(3)
+(bug49893, generators/bug71013; vedi §3.34). Corpus-gate CONTENUTO: 6 test ancora falliti cambiano chunk e i loro golden sono stati RI-BASATI dichiarando (4 verso l'oracle: exceptions/bug53511 — sparita la riga spuria «ops 2» —, temporary_cleaning_013 — sparito `string(4) "afoo"` prima di «caught Exception 1» —, coalesce/assign_coalesce_002 — secondo caso `$ary[new Dtor][id($foo)] ??=` ora == atteso —, magic_methods/bug29368_3 — Foo::__destruct prima di Bar —; 2 timing-only dentro divergenze pre-esistenti: exceptions/bug47771 — Zend NON costruisce `new Test(throw_exc())` se l'argomento lancia, phpr sì (§ da catalogare: ordine costruzione/argomenti) e ora stampa Destr prima del messaggio —, closures/bug70685 — handle-id #2→#4 della seconda Closure, Zend stampa NULL). **RESTA (2)**: temporaneo che muore al pop dell'operando DENTRO
+l'espressione, senza Ret in mezzo — `d(1)->n` (Zend distrugge il ricevitore alla FETCH_OBJ_R, prima dell'echo: phpr
+dopo), ricevitore temporaneo risorto in una static (`D::take()->m(1)`: cascata `C dtor` dopo la stampa, handle-id del
+`new` successivo 2 invece di 1), rilascio allo SROTOLAMENTO di un'eccezione (wp172 fx-mc2 C1: Zend stampa `dtor:Q`
+prima di «E1:», phpr ora al primo Ret dentro il catch — `getMessage()` — invece che a fine istruzione). Cura di (2):
+nota GC al punto di morte dell'operando (pop dei temp oggetto nei FetchProp/MethodCall su temporaneo, unwind): da
+cercare per NOME nel fail-set congelato prima di toccare il loop caldo.
 
 ## 4. Punti di forza da NON toccare (invarianti verificati byte-identici)
 

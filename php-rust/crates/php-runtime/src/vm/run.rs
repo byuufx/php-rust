@@ -4296,6 +4296,8 @@ impl<'m> super::Vm<'m> {
                         stack.clear();
                         self.frames.truncate(top);
                         self.frame_pool.put(slots, stack);
+                        // §3.35: dying locals destruct at `leave` (mod.rs `gc_sweep_after_ret`).
+                        self.gc_sweep_after_ret(top - 1)?;
                         if self.frames.len() == baseline {
                             return Ok(RunExit::Returned(ret));
                         }
@@ -7244,6 +7246,12 @@ impl<'m> super::Vm<'m> {
                 self.gc_note_frame(&dead);
                 self.recycle_frame(dead);
             }
+        }
+        // §3.35: dying locals destruct at `leave` (mod.rs `gc_sweep_after_ret`);
+        // a destructor frame's own return keeps the scheduled-sweep protocol
+        // (the Sweep op that pushed it re-runs when it returns).
+        if top > 0 && fl & FrameFlags::IN_DESTRUCTOR == 0 {
+            self.gc_sweep_after_ret(top - 1)?;
         }
         if let Some(guard) = guard {
             for key in guard {
