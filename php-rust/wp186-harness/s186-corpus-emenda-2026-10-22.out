@@ -1,0 +1,19 @@
+EMENDA DICHIARATA del fail-set congelato s109 e dei golden di contenuto (file LOCALI non tracciati: wp109-harness/.gitignore r.9
+ignora corpus-gate/ per REGOLE §10; questo .out è il registro auditabile). Causa: cura §3.34 + §3.35 (commit 4aa30319, 2026-10-22).
+Runner: phpt-runner dev-release costruito dal tree 4aa30319 (profilo dev-release, non il pin); corpus Zend/tests ×2 modi
+(PHPR_REG_LOWER=0/1); NOMI identici nei due modi; off↔on byte-id fuori carve-out; replay scripts/corpus-gate.sh rc=0 dopo l'emenda.
+
+NOMI (fail → pass, tolti da corpus-s109-{off,on}.fails e da golden-content-{off,on}.tsv): 1412 → 1409 per modo
+  -/Volumes/Extreme Pro/Claude/php-8.5.7/Zend/tests/bug49893.phpt
+  -/Volumes/Extreme Pro/Claude/php-8.5.7/Zend/tests/bug63882.phpt
+  -/Volumes/Extreme Pro/Claude/php-8.5.7/Zend/tests/generators/bug71013.phpt
+NUOVI FAIL: nessuno (entrambi i modi).
+
+GOLDEN RI-BASATI (sha256 del chunk, prefisso 8; identici nei due modi): test ANCORA falliti il cui output cambia
+  closures/bug70685.phpt                     793ef11a → 17efff37   timing-only: handle-id #2→#4 della seconda Closure (Zend stampa NULL)
+  coalesce/assign_coalesce_002.phpt          5b5d181c → 7abc7fa9   verso l'oracle: secondo caso `$ary[new Dtor][id($foo)] ??=` ora == atteso
+  exceptions/bug47771.phpt                   87ae23d7 → e89acabb   timing-only dentro divergenza pre-esistente (ctor-failed: Zend non costruisce `new Test(throw_exc())`)
+  exceptions/bug53511.phpt                   2513326f → 23cf4cc7   verso l'oracle: sparita la riga spuria «ops 2»
+  magic_methods/bug29368_3.phpt              04117002 → 08587a09   verso l'oracle: Foo::__destruct prima di Bar::__destruct
+  temporary_cleaning/temporary_cleaning_013.phpt 673e1e5e → 5ec49c82 verso l'oracle: sparito `string(4) "afoo"` prima di «caught Exception 1»
+Rilievo Pedersen (concilio S-186): il congelato NON è in git — decidere se tracciarlo (REGOLE §10 vs auditabilità).
